@@ -6359,8 +6359,7 @@ dependencies = [
 [[package]]
 name = "wasm_split_cli_support"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f32315b284f5b3787ecc7d98d39ee857174e43ff9a6a8c3fec9d189cb24fec74"
+source = "git+https://github.com/Mantiq-com/wasm-split-prototype.git?branch=test-fix-skip-empty-chunks#f6a67b9e433ffd3f517f454d8497dbdf387cc943"
 dependencies = [
  "eyre",
  "gimli 0.34.0",
