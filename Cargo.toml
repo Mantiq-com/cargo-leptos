@@ -21,7 +21,10 @@ libflate = "2.2"
 tracing = "0.1.44"
 cargo-config2 = "0.1.42"
 target-lexicon = "0.13.5"
-lightningcss = { version = "1.0.0-alpha.70", features = ["browserslist", "bundler"] }
+lightningcss = { version = "1.0.0-alpha.70", features = [
+    "browserslist",
+    "bundler",
+] }
 flexi_logger = "0.31.7"
 tokio = { version = "1.49", default-features = false, features = ["full"] }
 axum = { version = "0.8.8", features = ["ws"] }
@@ -61,7 +64,7 @@ ignore = "0.4.25"
 walkdir = "2.5"
 regex = "1.12.3"
 clap_complete = "4.5.66"
-wasm_split_cli_support = "0.2.3"
+wasm_split_cli_support = { git = "https://github.com/Mantiq-com/wasm-split-prototype.git", branch = "test-fix-skip-empty-chunks" }
 clearscreen = "4.0.5"
 tokio-process-tools = "0.11.0"
 
