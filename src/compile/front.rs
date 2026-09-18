@@ -78,10 +78,11 @@ pub async fn front(
             return Ok(Outcome::Success(product));
         }
 
-        // The previous output is about to be replaced; drop it first so a
-        // split chunk that no longer exists does not linger in the package
-        // directory (chunk names embed a content hash, so a rebuild rarely
-        // overwrites them in place).
+        // The previous output is about to be replaced; drop it first. Split
+        // chunks are numbered and the lazy-module files are named after
+        // their module, so a rebuild that produces fewer chunks, or drops a
+        // lazy module, would otherwise leave the old files in the package
+        // directory.
         remove_front_outputs(&pkg_dir, &proj.lib.output_name).await?;
 
         if proj.split {
