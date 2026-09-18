@@ -8,6 +8,7 @@ use crate::{
 };
 use leptos_hot_reload::ViewMacros;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::join;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -25,26 +26,62 @@ pub async fn watch(proj: &Arc<Project>) -> Result<()> {
         log::warn!("warning: Hot reloading does not currently work in --release mode.");
     }
 
-    let view_macros = if proj.hot_reload {
-        // build initial set of view macros for patching
-        let view_macros = ViewMacros::new();
-        view_macros
-            .update_from_paths(&proj.lib.src_paths)
-            .wrap_anyhow_err("Couldn't update view-macro watch")?;
-        Some(view_macros)
-    } else {
-        None
-    };
+    let view_macros = proj.hot_reload.then(ViewMacros::new);
 
-    service::notify::spawn(proj, view_macros).await?;
+    // The notify service holds a clone of the (still empty) view-macro table;
+    // the scan that fills it runs in the background once the server is up.
+    service::notify::spawn(proj, view_macros.clone()).await?;
     let serve_service_jh = service::serve::spawn(proj).await;
     let reload_service_jh = service::reload::spawn(proj).await;
+
+    if let Some(view_macros) = view_macros {
+        spawn_view_macro_scan(proj, view_macros);
+    }
 
     let res = run_loop(proj, serve_service_jh, reload_service_jh).await;
     if res.is_err() {
         Interrupt::request_shutdown().await;
     }
     res
+}
+
+/// Builds the initial view-macro table for hot-reload patching without holding
+/// up the server.
+///
+/// The scan parses every source file under the lib's path dependencies; on a
+/// workspace of ten thousand files it takes about a minute, and running it
+/// before `serve` kept the app unreachable for that long after every launch.
+/// `ViewMacros` shares its table behind an `Arc`, so the clone the notify
+/// service already holds sees the result the moment the scan finishes. Until
+/// then a changed file has no entry, and notify falls back to a normal rebuild
+/// exactly as it does for a file the scan does not cover. The parse itself is
+/// blocking CPU work, hence `spawn_blocking`; a parse failure ends the watch,
+/// as it did when the scan ran inline.
+fn spawn_view_macro_scan(proj: &Arc<Project>, view_macros: ViewMacros) {
+    let src_paths = proj.lib.src_paths.clone();
+    tokio::spawn(async move {
+        info!("Hot reload: scanning view macros");
+        let started = Instant::now();
+        let scan = tokio::task::spawn_blocking(move || {
+            view_macros
+                .update_from_paths(&src_paths)
+                .wrap_anyhow_err("Couldn't update view-macro watch")
+        })
+        .await;
+        match scan {
+            Ok(Ok(())) => {
+                info!("Hot reload: view macros ready in {:?}", started.elapsed());
+            }
+            Ok(Err(err)) => {
+                error!("{err:?}");
+                Interrupt::request_shutdown().await;
+            }
+            Err(err) => {
+                error!("View-macro scan did not complete: {err}");
+                Interrupt::request_shutdown().await;
+            }
+        }
+    });
 }
 
 pub async fn run_loop(
