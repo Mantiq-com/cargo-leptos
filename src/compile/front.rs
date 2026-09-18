@@ -303,7 +303,7 @@ pub fn build_cargo_front_cmd(
     (envs_str, line)
 }
 
-async fn bindgen(proj: &Project, all_wasm_files: &[Utf8PathBuf]) -> Result<Outcome<Product>> {
+async fn bindgen(proj: &Arc<Project>, all_wasm_files: &[Utf8PathBuf]) -> Result<Outcome<Product>> {
     let wasm_file = &proj.lib.wasm_file;
 
     info!("Front generating JS/WASM with wasm-bindgen");
@@ -392,9 +392,7 @@ async fn bindgen(proj: &Project, all_wasm_files: &[Utf8PathBuf]) -> Result<Outco
             .dot()?;
 
             if proj.release {
-                for file in all_wasm_files {
-                    optimize(proj, file).await?;
-                }
+                optimize_all(proj, all_wasm_files).await?;
             }
 
             let wasm_optimize_end_time = tokio::time::Instant::now();
@@ -431,6 +429,35 @@ async fn bindgen(proj: &Project, all_wasm_files: &[Utf8PathBuf]) -> Result<Outco
             Ok(Outcome::Success(Product::Front))
         }
     }
+}
+
+/// Runs wasm-opt over every output module, several at a time.
+///
+/// wasm-opt parallelises inside one process only across the functions of a
+/// large module. A split build produces one large main module and thousands
+/// of small chunks (over ten thousand on a large app), and optimising those
+/// one after another took a quarter of an hour on a 384-core machine while
+/// using one core. The chunks are independent, so as many run at once as
+/// there are cores; the first failure stops the rest.
+async fn optimize_all(proj: &Arc<Project>, files: &[Utf8PathBuf]) -> Result<()> {
+    let parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let permits = Arc::new(tokio::sync::Semaphore::new(parallelism));
+    let mut runs = tokio::task::JoinSet::new();
+    for file in files {
+        let permit = permits.clone().acquire_owned().await?;
+        let proj = proj.clone();
+        let file = file.clone();
+        runs.spawn(async move {
+            let _permit = permit;
+            optimize(&proj, &file).await
+        });
+    }
+    while let Some(run) = runs.join_next().await {
+        run??;
+    }
+    Ok(())
 }
 
 async fn optimize(proj: &Project, file: &Utf8Path) -> Result<()> {
