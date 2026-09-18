@@ -32,6 +32,80 @@ async fn try_rm_dir_content<P: AsRef<Path>>(dir: P) -> Result<()> {
     Ok(())
 }
 
+/// Removes the contents of `dir` like [`rm_dir_content`], except the entry
+/// that is, or contains, `keep`. `keep` is kept whole: nothing below it is
+/// touched.
+pub async fn rm_dir_content_except(dir: &Utf8Path, keep: &Utf8Path) -> Result<()> {
+    if !dir.exists() {
+        debug!("Leptos not cleaning {dir:?} because it does not exist");
+        return Ok(());
+    }
+
+    let mut entries = self::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = Utf8PathBuf::try_from(entry.path())
+            .wrap_err_with(|| format!("Non-UTF-8 entry in {dir}"))?;
+        if keep.starts_with(&path) {
+            continue;
+        }
+        if entry.file_type().await?.is_dir() {
+            self::remove_dir_all(&path).await?;
+        } else {
+            self::remove_file(&path).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rm_dir_content_except_tests {
+    use super::*;
+    use std::fs;
+    use temp_dir::TempDir;
+
+    #[tokio::test]
+    async fn keeps_the_named_directory_and_removes_everything_else() {
+        let dir = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(root.join("pkg/snippets")).unwrap();
+        fs::write(root.join("pkg/app.wasm"), b"x").unwrap();
+        fs::write(root.join("pkg/snippets/a.js"), b"x").unwrap();
+        fs::create_dir_all(root.join("images")).unwrap();
+        fs::write(root.join("images/logo.svg"), b"x").unwrap();
+        fs::write(root.join("index.html"), b"x").unwrap();
+
+        rm_dir_content_except(&root, &root.join("pkg"))
+            .await
+            .unwrap();
+
+        assert!(root.join("pkg/app.wasm").exists());
+        assert!(root.join("pkg/snippets/a.js").exists());
+        assert!(!root.join("images").exists());
+        assert!(!root.join("index.html").exists());
+    }
+
+    #[tokio::test]
+    async fn keeps_the_ancestors_of_a_nested_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(root.join("static/pkg")).unwrap();
+        fs::write(root.join("static/pkg/app.wasm"), b"x").unwrap();
+        fs::write(root.join("static/other.txt"), b"x").unwrap();
+        fs::write(root.join("index.html"), b"x").unwrap();
+
+        rm_dir_content_except(&root, &root.join("static/pkg"))
+            .await
+            .unwrap();
+
+        assert!(root.join("static/pkg/app.wasm").exists());
+        assert!(
+            root.join("static/other.txt").exists(),
+            "an ancestor is kept whole"
+        );
+        assert!(!root.join("index.html").exists());
+    }
+}
+
 pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
     fs::write(&path, contents)
         .await
