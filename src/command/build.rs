@@ -52,6 +52,12 @@ async fn build_frontend(proj: &Arc<Project>, changes: &ChangeSet) -> Result<bool
     Ok(true)
 }
 
+/// Whether a previous process recorded the wasm hash its package output was
+/// generated from, so that output is worth keeping through the startup wipe.
+fn front_output_may_be_reused(proj: &Project) -> bool {
+    compile::persists_front_wasm_hash(proj) && compile::front_wasm_hash_file(proj).exists()
+}
+
 /// Build the project. Returns true if the build was successful
 pub async fn build_proj(proj: &Arc<Project>) -> Result<bool> {
     let changes = ChangeSet::all_changes();
@@ -63,7 +69,18 @@ pub async fn build_proj(proj: &Arc<Project>) -> Result<bool> {
     } else if needs_frontend {
         // only delete the existing frontend build content if we're rebuilding it, not for a
         // server-only build
-        fs::rm_dir_content(&proj.site.root_dir).await.dot()?;
+        if front_output_may_be_reused(proj) {
+            // The previous process left a hash of the wasm its package output was
+            // generated from. Keep that output: if the wasm links to the same bytes
+            // again, the front step reuses it instead of splitting and running
+            // wasm-bindgen; otherwise the front step removes it before generating.
+            let pkg_dir = proj.site.root_relative_pkg_dir();
+            fs::rm_dir_content_except(&proj.site.root_dir, &pkg_dir)
+                .await
+                .dot()?;
+        } else {
+            fs::rm_dir_content(&proj.site.root_dir).await.dot()?;
+        }
     }
 
     let can_parallelize = !(proj.hash_files || proj.release && proj.precompress);

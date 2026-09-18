@@ -12,7 +12,7 @@ use crate::{
     signal::{Interrupt, Outcome, Product},
     wasm_split_tools,
 };
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::path::Path;
@@ -78,6 +78,12 @@ pub async fn front(
             return Ok(Outcome::Success(product));
         }
 
+        // The previous output is about to be replaced; drop it first so a
+        // split chunk that no longer exists does not linger in the package
+        // directory (chunk names embed a content hash, so a rebuild rarely
+        // overwrites them in place).
+        remove_front_outputs(&pkg_dir, &proj.lib.output_name).await?;
+
         if proj.split {
             info!("Front splitting out lazy-loaded WASM files");
             let start_time = tokio::time::Instant::now();
@@ -108,28 +114,42 @@ fn front_wasm_registry() -> &'static Mutex<HashMap<String, u64>> {
 }
 
 /// Removes and returns the hash of the wasm consumed by the last successful
-/// split/bindgen run in this process. Taken rather than read so the entry
-/// only exists while the output it describes is intact: the caller re-inserts
-/// it once this run ends with the output known good, and a failed or
-/// interrupted run leaves it absent.
+/// split/bindgen run. Taken rather than read so the entry only exists while
+/// the output it describes is intact: the caller re-inserts it once this run
+/// ends with the output known good, and a failed or interrupted run leaves it
+/// absent.
+///
+/// The in-process registry answers within a `watch` session. A new process
+/// falls back to the hash the previous process persisted beside the linked
+/// wasm, so a launch whose sources are unchanged can reuse the output that
+/// [`crate::command::build::build_proj`] kept in place for it.
 fn take_front_wasm_hash(proj: &Project) -> Option<u64> {
-    front_wasm_registry()
+    let in_process = front_wasm_registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .remove(proj.lib.wasm_file.source.as_str())
+        .remove(proj.lib.wasm_file.source.as_str());
+    if !persists_front_wasm_hash(proj) {
+        return in_process;
+    }
+    // Taken as well, even when the registry answered: while this run's
+    // pipeline is in flight no record may vouch for the output on disk.
+    let persisted = take_persisted_front_wasm_hash(&front_wasm_hash_file(proj));
+    in_process.or(persisted)
 }
 
 /// Reports whether the front wasm artifact (hashed into `hash`) is
-/// byte-identical to the input of the last successful split/bindgen run in
-/// this process (`previous_hash`, taken from the registry by the caller).
+/// byte-identical to the input of the last successful split/bindgen run
+/// (`previous_hash`, taken by the caller from the registry or the persisted
+/// file).
 ///
 /// A rebuild caused by a change that only affects the server binary (or a
 /// watched non-Rust file) does not alter the wasm: splitting and wasm-bindgen
 /// would reproduce identical output, so the caller can skip them and keep the
 /// previous output. A content hash rather than mtime, because a relink from
-/// unchanged inputs rewrites the file without changing its bytes. The first
-/// build in a process always reports "changed" (the site directory is
-/// repopulated at startup), and so does a missing bindgen output.
+/// unchanged inputs rewrites the file without changing its bytes. A missing
+/// bindgen output always reports "changed", which is also what the first
+/// build of a process sees when no hash was persisted and the site directory
+/// was wiped at startup.
 fn front_wasm_unchanged(proj: &Project, previous_hash: Option<u64>, hash: u64) -> bool {
     previous_hash == Some(hash) && proj.lib.js_file.dest.exists()
 }
@@ -144,6 +164,77 @@ fn record_front_wasm(proj: &Project, hash: u64) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(proj.lib.wasm_file.source.to_string(), hash);
+    if persists_front_wasm_hash(proj) {
+        let file = front_wasm_hash_file(proj);
+        if let Err(err) = std::fs::write(&file, hash.to_string()) {
+            warn!("Could not persist the front wasm hash to {file}: {err}");
+        }
+    }
+}
+
+/// The persisted hash serves development watches. A release build always
+/// regenerates (its output is what ships), and hashed file names rename the
+/// outputs after generation, so their presence cannot be read back from the
+/// unhashed paths the gate checks.
+pub fn persists_front_wasm_hash(proj: &Project) -> bool {
+    !proj.release && !proj.hash_files
+}
+
+/// Beside the linked wasm in the target directory, which survives a restart;
+/// the site directory does not, and is the thing the hash vouches for.
+pub fn front_wasm_hash_file(proj: &Project) -> Utf8PathBuf {
+    Utf8PathBuf::from(format!("{}.front-hash", proj.lib.wasm_file.source))
+}
+
+/// Reads and removes the persisted hash, mirroring the registry's take
+/// semantics: while the pipeline runs, no record vouches for the output.
+fn take_persisted_front_wasm_hash(file: &Utf8Path) -> Option<u64> {
+    let contents = std::fs::read_to_string(file).ok()?;
+    if let Err(err) = std::fs::remove_file(file) {
+        warn!("Could not remove the front wasm hash file {file}: {err}");
+    }
+    let hash = contents.trim().parse().ok();
+    if hash.is_none() {
+        warn!("Ignoring the unreadable front wasm hash file {file}");
+    }
+    hash
+}
+
+/// Removes what the split and bindgen steps write into the package
+/// directory: the main module, its JS glue and type declarations, the snippet
+/// directory, and the split chunks, loader and manifest. Everything else in
+/// the directory -- the stylesheet the style step writes concurrently, and
+/// whatever the user placed there -- is left alone.
+async fn remove_front_outputs(pkg_dir: &Utf8Path, output_name: &str) -> Result<()> {
+    if !pkg_dir.exists() {
+        return Ok(());
+    }
+    let owned_files = [
+        format!("{output_name}.js"),
+        format!("{output_name}.wasm"),
+        format!("{output_name}_bg.wasm"),
+        format!("{output_name}.d.ts"),
+        format!("{output_name}_bg.wasm.d.ts"),
+    ];
+    let mut entries = fs::read_dir(pkg_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_dir = entry.file_type().await?.is_dir();
+        if is_dir {
+            if name == "snippets" {
+                fs::remove_dir_all(entry.path()).await?;
+            }
+            continue;
+        }
+        let split_output = name.starts_with("__wasm_split")
+            || name.starts_with("split_load_")
+            || name.starts_with("chunk_");
+        if split_output || owned_files.iter().any(|owned| *owned == name) {
+            fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 pub fn front_cargo_process(
@@ -414,4 +505,81 @@ fn minify<JS: AsRef<str>>(js: JS) -> Result<String> {
         .wrap_anyhow_err("Failed to minify")?;
 
     Ok(output.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use temp_dir::TempDir;
+
+    fn utf8(dir: &TempDir) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn a_persisted_hash_is_read_once_and_then_gone() {
+        let dir = TempDir::new().unwrap();
+        let file = utf8(&dir).join("app.wasm.front-hash");
+        fs::write(&file, "1234567890123\n").unwrap();
+
+        assert_eq!(take_persisted_front_wasm_hash(&file), Some(1234567890123));
+        assert!(!file.exists(), "the take removes the file");
+        assert_eq!(take_persisted_front_wasm_hash(&file), None);
+    }
+
+    #[test]
+    fn an_unreadable_persisted_hash_is_ignored_and_removed() {
+        let dir = TempDir::new().unwrap();
+        let file = utf8(&dir).join("app.wasm.front-hash");
+        fs::write(&file, "not a number").unwrap();
+
+        assert_eq!(take_persisted_front_wasm_hash(&file), None);
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_front_outputs_leaves_the_stylesheet_and_foreign_files() {
+        let dir = TempDir::new().unwrap();
+        let pkg_dir = utf8(&dir);
+        for name in [
+            "app.js",
+            "app.wasm",
+            "app_bg.wasm",
+            "app.d.ts",
+            "app_bg.wasm.d.ts",
+            "__wasm_split.______________________.js",
+            "__wasm_split_manifest.json",
+            "split_load_settings_123.wasm",
+            "chunk_7.wasm",
+            "app.css",
+            "other.js",
+            "notes.txt",
+        ] {
+            fs::write(pkg_dir.join(name), b"x").unwrap();
+        }
+        fs::create_dir_all(pkg_dir.join("snippets").join("inline0")).unwrap();
+        fs::write(pkg_dir.join("snippets/inline0/inline0.js"), b"x").unwrap();
+        fs::create_dir_all(pkg_dir.join("fonts")).unwrap();
+        fs::write(pkg_dir.join("fonts/a.woff2"), b"x").unwrap();
+
+        remove_front_outputs(&pkg_dir, "app").await.unwrap();
+
+        let mut remaining: Vec<String> = fs::read_dir(&pkg_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, ["app.css", "fonts", "notes.txt", "other.js"]);
+    }
+
+    #[tokio::test]
+    async fn removing_front_outputs_from_a_missing_directory_is_fine() {
+        let dir = TempDir::new().unwrap();
+        let pkg_dir = utf8(&dir).join("never-built");
+
+        remove_front_outputs(&pkg_dir, "app").await.unwrap();
+
+        assert!(!pkg_dir.exists());
+    }
 }
