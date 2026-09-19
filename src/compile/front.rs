@@ -14,6 +14,7 @@ use crate::{
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use swc::{
     config::{IsModule, JsMinifyOptions},
@@ -38,8 +39,6 @@ pub async fn front(
         }
 
         let pkg_dir = proj.site.root_relative_pkg_dir();
-
-        let mut files = vec![proj.lib.wasm_file.dest.clone()];
 
         fs::create_dir_all(&pkg_dir).await?;
 
@@ -81,23 +80,43 @@ pub async fn front(
         // directory.
         remove_front_outputs(&pkg_dir, &proj.lib.output_name).await?;
 
-        if proj.split {
+        let split_files = if proj.split {
             info!("Front splitting out lazy-loaded WASM files");
             let start_time = tokio::time::Instant::now();
 
             let split_files = wasm_split_tools::wasm_split(&input_wasm, false, &proj).await?;
-            files.extend(split_files);
 
             let end_time = tokio::time::Instant::now();
 
             info!("Finished WASM splitting in {:?}", end_time - start_time);
-        }
+            split_files
+        } else {
+            Vec::new()
+        };
 
         // The module can be gigabytes; release it before wasm-bindgen loads
         // its own copy.
         drop(input_wasm);
 
-        let outcome = bindgen(&proj, &files).await.dot();
+        // The split chunks are final once written: wasm-bindgen reads only
+        // the main module and writes only its own outputs, so in a release
+        // build the chunks are optimised while wasm-bindgen runs. `try_join!`
+        // drops the other future on the first error, which kills the
+        // processes it was waiting on.
+        let optimize_chunks = async {
+            if proj.release {
+                optimize_all(&proj, &split_files).await
+            } else {
+                Ok(Outcome::Success(()))
+            }
+        };
+        let outcome = tokio::try_join!(bindgen(&proj), optimize_chunks)
+            .map(|(outcome, chunks)| match chunks {
+                Outcome::Success(()) => outcome,
+                Outcome::Stopped => Outcome::Stopped,
+                Outcome::Failed => Outcome::Failed,
+            })
+            .dot();
         if let Ok(Outcome::Success(_)) = &outcome {
             record_front_wasm(&proj, wasm_hash);
         }
@@ -303,7 +322,10 @@ pub fn build_cargo_front_cmd(
     (envs_str, line)
 }
 
-async fn bindgen(proj: &Arc<Project>, all_wasm_files: &[Utf8PathBuf]) -> Result<Outcome<Product>> {
+/// Runs wasm-bindgen on the main module and, in a release build, wasm-opt on
+/// its output and the JS minifier on its glue. The split chunks are not
+/// touched here; [`front`] optimises them concurrently with this function.
+async fn bindgen(proj: &Arc<Project>) -> Result<Outcome<Product>> {
     let wasm_file = &proj.lib.wasm_file;
 
     info!("Front generating JS/WASM with wasm-bindgen");
@@ -391,34 +413,48 @@ async fn bindgen(proj: &Arc<Project>, all_wasm_files: &[Utf8PathBuf]) -> Result<
             .await
             .dot()?;
 
-            if proj.release {
-                optimize_all(proj, all_wasm_files).await?;
-            }
-
-            let wasm_optimize_end_time = tokio::time::Instant::now();
-            debug!(
-                "Finished optimizing WASM in {:?}",
-                wasm_optimize_end_time - bindgen_emit_end_time
-            );
-
-            if proj.js_minify {
+            // wasm-opt rewrites only the main module and the minifier only
+            // the JS glue, both complete at this point, so the two run side
+            // by side.
+            let optimize_main = async {
+                if !proj.release {
+                    return Ok(Outcome::Success(()));
+                }
+                let wasm_opt = Exe::WasmOpt.get().await.dot()?;
+                let outcome = optimize(proj, &wasm_opt, &wasm_file.dest).await?;
+                debug!(
+                    "Finished optimizing WASM in {:?}",
+                    bindgen_emit_end_time.elapsed()
+                );
+                Ok(outcome)
+            };
+            let minify_js = async {
+                if !proj.js_minify {
+                    return Ok(());
+                }
                 let js_file_name = wasm_file
                     .dest
                     .clone()
                     .without_last()
                     .join(format!("{}.js", &proj.lib.output_name));
                 let js = fs::read_to_string(&js_file_name).await?;
+                // swc is CPU-bound work; keep it off the runtime threads.
+                let minified = tokio::task::spawn_blocking(move || minify(&js)).await??;
                 proj.site
-                    .updated_with(&proj.lib.js_file, minify(&js)?.as_bytes())
+                    .updated_with(&proj.lib.js_file, minified.as_bytes())
                     .await
                     .dot()?;
 
-                let js_minify_end_time = tokio::time::Instant::now();
                 debug!(
                     "Finished minifying JS in {:?}",
-                    js_minify_end_time - wasm_optimize_end_time
+                    bindgen_emit_end_time.elapsed()
                 );
+                Ok::<(), Error>(())
             };
+            let (optimized, ()) = tokio::try_join!(optimize_main, minify_js)?;
+            if optimized == Outcome::Stopped {
+                return Ok(Outcome::Stopped);
+            }
 
             let front_end_time = tokio::time::Instant::now();
             info!(
@@ -431,38 +467,48 @@ async fn bindgen(proj: &Arc<Project>, all_wasm_files: &[Utf8PathBuf]) -> Result<
     }
 }
 
-/// Runs wasm-opt over every output module, several at a time.
+/// Runs wasm-opt over the split chunks, several at a time.
 ///
 /// wasm-opt parallelises inside one process only across the functions of a
-/// large module. A split build produces one large main module and thousands
-/// of small chunks (over ten thousand on a large app), and optimising those
-/// one after another took a quarter of an hour on a 384-core machine while
-/// using one core. The chunks are independent, so as many run at once as
-/// there are cores; the first failure stops the rest.
-async fn optimize_all(proj: &Arc<Project>, files: &[Utf8PathBuf]) -> Result<()> {
+/// large module. A split build produces thousands of small chunks (over ten
+/// thousand on a large app), and optimising those one after another took a
+/// quarter of an hour on a 384-core machine while using one core. The chunks
+/// are independent, so as many run at once as there are cores; the first
+/// failure stops the rest, and an interrupt reports `Outcome::Stopped` like
+/// the other pipeline steps.
+async fn optimize_all(proj: &Arc<Project>, files: &[Utf8PathBuf]) -> Result<Outcome<()>> {
+    if files.is_empty() {
+        return Ok(Outcome::Success(()));
+    }
+    let wasm_opt = Arc::new(Exe::WasmOpt.get().await.dot()?);
     let parallelism = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
-    let permits = Arc::new(tokio::sync::Semaphore::new(parallelism));
     let mut runs = tokio::task::JoinSet::new();
-    for file in files {
-        let permit = permits.clone().acquire_owned().await?;
-        let proj = proj.clone();
-        let file = file.clone();
-        runs.spawn(async move {
-            let _permit = permit;
-            optimize(&proj, &file).await
-        });
+    let mut pending = files.iter();
+    let mut outcome = Outcome::Success(());
+    loop {
+        // Top the set up as runs finish rather than queueing every file at
+        // once: a wasm-opt started after an interrupt would not see it, so
+        // once one run reports `Stopped` nothing more is started.
+        while runs.len() < parallelism && outcome == Outcome::Success(()) {
+            let Some(file) = pending.next() else { break };
+            let proj = proj.clone();
+            let wasm_opt = wasm_opt.clone();
+            let file = file.clone();
+            runs.spawn(async move { optimize(&proj, &wasm_opt, &file).await });
+        }
+        let Some(run) = runs.join_next().await else {
+            break;
+        };
+        if run?? == Outcome::Stopped {
+            outcome = Outcome::Stopped;
+        }
     }
-    while let Some(run) = runs.join_next().await {
-        run??;
-    }
-    Ok(())
+    Ok(outcome)
 }
 
-async fn optimize(proj: &Project, file: &Utf8Path) -> Result<()> {
-    let wasm_opt = Exe::WasmOpt.get().await.dot()?;
-
+async fn optimize(proj: &Project, wasm_opt: &Path, file: &Utf8Path) -> Result<Outcome<()>> {
     let mut args: Vec<&str> = if let Some(features) = &proj.wasm_opt_features {
         features.iter().map(|f| f.as_str()).collect()
     } else {
@@ -482,8 +528,8 @@ async fn optimize(proj: &Project, file: &Utf8Path) -> Result<()> {
     match wait_piped_interruptible("wasm-opt", cmd, crate::signal::Interrupt::subscribe_any())
         .await?
     {
-        CommandResult::Success(_) => Ok(()),
-        CommandResult::Interrupted => bail!("wasm-opt was interrupted"),
+        CommandResult::Success(_) => Ok(Outcome::Success(())),
+        CommandResult::Interrupted => Ok(Outcome::Stopped),
         CommandResult::Failure(output) => {
             error!("wasm-opt failed with:");
             println!("{}", output.stderr());
