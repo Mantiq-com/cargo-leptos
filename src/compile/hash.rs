@@ -3,10 +3,13 @@ use crate::{
     ext::{eyre::CustomWrapErr, PathBufExt},
     internal_prelude::*,
 };
+use aho_corasick::{AhoCorasick, MatchKind};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use camino::Utf8PathBuf;
 use eyre::{ContextCompat, Result};
 use md5::{Digest, Md5};
+use memchr::memmem;
+use rayon::prelude::*;
 use std::{collections::HashMap, fs};
 
 ///Adds hashes to the filenames of the css, js, and wasm files in the output
@@ -132,8 +135,12 @@ pub fn add_hashes_to_site(proj: &Project) -> Result<()> {
     Ok(())
 }
 
+/// Hashes every file the package directory holds, except the ones that must
+/// keep their names. A split build emits thousands of chunks next to a main
+/// module of hundreds of megabytes, so the files are hashed in parallel once
+/// the directory walk has listed them.
 fn compute_front_file_hashes(proj: &Project) -> Result<HashMap<Utf8PathBuf, String>> {
-    let mut files_to_hashes = HashMap::new();
+    let mut files = Vec::new();
 
     let mut stack = vec![proj.site.root_relative_pkg_dir().into_std_path_buf()];
 
@@ -158,28 +165,28 @@ fn compute_front_file_hashes(proj: &Project) -> Result<HashMap<Utf8PathBuf, Stri
                         }
                     }
 
-                    let hash = Base64UrlUnpadded::encode_string(
-                        &Md5::new().chain_update(fs::read(&path)?).finalize(),
-                    );
-
-                    if path
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == hash)
-                    {
-                        continue;
-                    }
-
-                    files_to_hashes.insert(
-                        Utf8PathBuf::from_path_buf(path).expect("invalid path"),
-                        hash,
-                    );
+                    files.push(Utf8PathBuf::from_path_buf(path).expect("invalid path"));
                 } else if path.is_dir() {
                     stack.push(path);
                 }
             }
         }
     }
+
+    let hashed: Vec<(Utf8PathBuf, String)> = files
+        .into_par_iter()
+        .map(|path| {
+            let hash = Base64UrlUnpadded::encode_string(
+                &Md5::new().chain_update(fs::read(&path)?).finalize(),
+            );
+            Ok((path, hash))
+        })
+        .collect::<Result<_>>()?;
+
+    let files_to_hashes = hashed
+        .into_iter()
+        .filter(|(path, hash)| path.file_stem() != Some(hash.as_str()))
+        .collect();
 
     Ok(files_to_hashes)
 }
@@ -222,24 +229,36 @@ fn rename_files(
     Ok(old_to_new_paths)
 }
 
+/// Rewrites every `root_dir`-relative old name in `old_to_new_paths` that the
+/// text file at `path` mentions to its new name, in one pass over the file:
+/// with thousands of renamed chunks, one `str::replace` per rename would scan
+/// the whole file thousands of times.
 fn replace_in_file(
     path: &Utf8PathBuf,
     old_to_new_paths: &HashMap<Utf8PathBuf, Utf8PathBuf>,
     root_dir: &Utf8PathBuf,
 ) {
-    let mut contents = fs::read_to_string(path)
+    let contents = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("error {e}: could not read file {path}"));
 
-    for (old_path, new_path) in old_to_new_paths {
-        let old_path = old_path
-            .strip_prefix(root_dir)
-            .expect("could not strip root path");
-        let new_path = new_path
-            .strip_prefix(root_dir)
-            .expect("could not strip root path");
+    let (old_names, new_names): (Vec<&str>, Vec<&str>) = old_to_new_paths
+        .iter()
+        .map(|(old_path, new_path)| {
+            let old_path = old_path
+                .strip_prefix(root_dir)
+                .expect("could not strip root path");
+            let new_path = new_path
+                .strip_prefix(root_dir)
+                .expect("could not strip root path");
+            (old_path.as_str(), new_path.as_str())
+        })
+        .unzip();
 
-        contents = contents.replace(old_path.as_str(), new_path.as_str());
-    }
+    let matcher = AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&old_names)
+        .expect("could not build the file name matcher");
+    let contents = matcher.replace_all(&contents, &new_names);
 
     fs::write(path, contents).expect("could not write file");
 }
@@ -294,6 +313,10 @@ fn rewrite_manifest(
     fs::write(path, new_contents).wrap_err_with(|| format!("Failed to write manifest {path}"))
 }
 
+/// Overwrites every occurrence of `old_wasm_split` in the wasm binary at
+/// `path` with `new_wasm_split`, which must have the same length so the
+/// module's section sizes stay valid. A file that does not contain the name
+/// is left untouched rather than written back unchanged.
 fn replace_in_binary_file(path: &Utf8PathBuf, old_wasm_split: &str, new_wasm_split: &str) {
     let mut contents =
         fs::read(path).unwrap_or_else(|e| panic!("error {e}: could not read file {path}"));
@@ -301,10 +324,12 @@ fn replace_in_binary_file(path: &Utf8PathBuf, old_wasm_split: &str, new_wasm_spl
     let old_path = old_wasm_split.as_bytes();
     let new_path = new_wasm_split.as_bytes();
 
-    for i in 0..=contents.len() - old_path.len() {
-        if contents[i..].starts_with(old_path) {
-            contents[i..(i + old_path.len())].clone_from_slice(new_path);
-        }
+    let positions: Vec<usize> = memmem::find_iter(&contents, old_path).collect();
+    if positions.is_empty() {
+        return;
+    }
+    for i in positions {
+        contents[i..(i + old_path.len())].clone_from_slice(new_path);
     }
 
     fs::write(path, contents).expect("could not write file");
@@ -320,17 +345,14 @@ fn replace_wasm_split_references(
     new_wasm_split_filename: &str,
     renamed_files: &HashMap<Utf8PathBuf, Utf8PathBuf>,
 ) -> Result<()> {
+    let mut wasm_files = Vec::new();
     for entry in fs::read_dir(pkg_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
             if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                 if filename.ends_with(".wasm") {
-                    replace_in_binary_file(
-                        &Utf8PathBuf::try_from(path).unwrap(),
-                        old_wasm_split_filename,
-                        new_wasm_split_filename,
-                    );
+                    wasm_files.push(Utf8PathBuf::try_from(path).unwrap());
                 } else if filename.starts_with("__wasm_split_manifest") {
                     rewrite_manifest(
                         &Utf8PathBuf::try_from(path).unwrap(),
@@ -342,6 +364,12 @@ fn replace_wasm_split_references(
         }
     }
 
+    // Each binary is patched on its own; with thousands of chunks this is
+    // the bulk of the work.
+    wasm_files.par_iter().for_each(|path| {
+        replace_in_binary_file(path, old_wasm_split_filename, new_wasm_split_filename);
+    });
+
     Ok(())
 }
 
@@ -349,6 +377,77 @@ fn replace_wasm_split_references(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn binary_patch_replaces_every_occurrence_and_skips_untouched_files() {
+        let dir = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join("cargo_leptos_hash_rs_binary_patch_test"),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let old = "__wasm_split.______________________.js";
+        let new = "__wasm_split.NEWSPLITHASH1234567890.js";
+        assert_eq!(old.len(), new.len());
+
+        let patched = dir.join("chunk_1.wasm");
+        fs::write(&patched, format!("\0asm{old}--{old}")).unwrap();
+        // Shorter than the name being searched for: the naive byte loop this
+        // replaced computed `len - pattern_len` and panicked on such a chunk.
+        let tiny = dir.join("chunk_2.wasm");
+        fs::write(&tiny, b"\0asm").unwrap();
+        let unrelated = dir.join("chunk_3.wasm");
+        fs::write(&unrelated, b"\0asm no loader reference here").unwrap();
+        let unrelated_mtime = fs::metadata(&unrelated).unwrap().modified().unwrap();
+
+        replace_in_binary_file(&patched, old, new);
+        replace_in_binary_file(&tiny, old, new);
+        replace_in_binary_file(&unrelated, old, new);
+
+        assert_eq!(
+            fs::read(&patched).unwrap(),
+            format!("\0asm{new}--{new}").into_bytes()
+        );
+        assert_eq!(fs::read(&tiny).unwrap(), b"\0asm");
+        assert_eq!(
+            fs::metadata(&unrelated).unwrap().modified().unwrap(),
+            unrelated_mtime,
+            "a file without the name is not rewritten"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn text_patch_rewrites_all_names_in_one_pass_preferring_the_longest() {
+        let dir = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join("cargo_leptos_hash_rs_text_patch_test"),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("app.js");
+        fs::write(
+            &file,
+            "import('./chunk_1.wasm'); import('./chunk_10.wasm'); fetch('app.wasm.d.ts'); fetch('app.wasm')",
+        )
+        .unwrap();
+        let renamed = HashMap::from([
+            (dir.join("chunk_1.wasm"), dir.join("chunk_1.AAAA.wasm")),
+            (dir.join("chunk_10.wasm"), dir.join("chunk_10.BBBB.wasm")),
+            (dir.join("app.wasm"), dir.join("app.CCCC.wasm")),
+            (dir.join("app.wasm.d.ts"), dir.join("app.wasm.DDDD.d.ts")),
+        ]);
+
+        replace_in_file(&file, &renamed, &dir);
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "import('./chunk_1.AAAA.wasm'); import('./chunk_10.BBBB.wasm'); fetch('app.wasm.DDDD.d.ts'); fetch('app.CCCC.wasm')"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn does_not_repatch_the_wasm_split_loader_it_already_patched_1() {
