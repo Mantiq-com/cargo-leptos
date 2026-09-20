@@ -55,6 +55,7 @@ leptos_hot_reload = "0.8.6"
 pathdiff = { version = "0.2.3", features = ["camino"] }
 semver = "1.0"
 md-5 = "0.11.0"
+memchr = "2.8"
 base64ct = { version = "1.8.3", features = ["std"] }
 swc = "79.0"
 swc_common = "26.0"
