@@ -52,7 +52,9 @@ leptos_hot_reload = "0.8.3"
 pathdiff = { version = "0.2.3", features = ["camino"] }
 semver = "1.0"
 md-5 = "0.10.6"
+rayon = "1.11"
 memchr = "2.8"
+aho-corasick = "1.1"
 base64ct = { version = "1.7.3", features = ["std"] }
 swc = "55.0"
 swc_common = "18.0"

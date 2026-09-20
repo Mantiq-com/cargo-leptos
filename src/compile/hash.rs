@@ -3,11 +3,13 @@ use crate::{
     ext::{eyre::CustomWrapErr, PathBufExt},
     internal_prelude::*,
 };
+use aho_corasick::{AhoCorasick, MatchKind};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use camino::Utf8PathBuf;
 use eyre::{ContextCompat, Result};
 use md5::{Digest, Md5};
 use memchr::memmem;
+use rayon::prelude::*;
 use std::{collections::HashMap, fs};
 
 ///Adds hashes to the filenames of the css, js, and wasm files in the output
@@ -134,7 +136,7 @@ pub fn add_hashes_to_site(proj: &Project) -> Result<()> {
 }
 
 fn compute_front_file_hashes(proj: &Project) -> Result<HashMap<Utf8PathBuf, String>> {
-    let mut files_to_hashes = HashMap::new();
+    let mut files = Vec::new();
 
     let mut stack = vec![proj.site.root_relative_pkg_dir().into_std_path_buf()];
 
@@ -159,28 +161,28 @@ fn compute_front_file_hashes(proj: &Project) -> Result<HashMap<Utf8PathBuf, Stri
                         }
                     }
 
-                    let hash = Base64UrlUnpadded::encode_string(
-                        &Md5::new().chain_update(fs::read(&path)?).finalize(),
-                    );
-
-                    if path
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == hash)
-                    {
-                        continue;
-                    }
-
-                    files_to_hashes.insert(
-                        Utf8PathBuf::from_path_buf(path).expect("invalid path"),
-                        hash,
-                    );
+                    files.push(Utf8PathBuf::from_path_buf(path).expect("invalid path"));
                 } else if path.is_dir() {
                     stack.push(path);
                 }
             }
         }
     }
+
+    let hashed: Vec<(Utf8PathBuf, String)> = files
+        .into_par_iter()
+        .map(|path| {
+            let hash = Base64UrlUnpadded::encode_string(
+                &Md5::new().chain_update(fs::read(&path)?).finalize(),
+            );
+            Ok((path, hash))
+        })
+        .collect::<Result<_>>()?;
+
+    let files_to_hashes = hashed
+        .into_iter()
+        .filter(|(path, hash)| path.file_stem() != Some(hash.as_str()))
+        .collect();
 
     Ok(files_to_hashes)
 }
@@ -228,19 +230,27 @@ fn replace_in_file(
     old_to_new_paths: &HashMap<Utf8PathBuf, Utf8PathBuf>,
     root_dir: &Utf8PathBuf,
 ) {
-    let mut contents = fs::read_to_string(path)
+    let contents = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("error {e}: could not read file {path}"));
 
-    for (old_path, new_path) in old_to_new_paths {
-        let old_path = old_path
-            .strip_prefix(root_dir)
-            .expect("could not strip root path");
-        let new_path = new_path
-            .strip_prefix(root_dir)
-            .expect("could not strip root path");
+    let (old_names, new_names): (Vec<&str>, Vec<&str>) = old_to_new_paths
+        .iter()
+        .map(|(old_path, new_path)| {
+            let old_path = old_path
+                .strip_prefix(root_dir)
+                .expect("could not strip root path");
+            let new_path = new_path
+                .strip_prefix(root_dir)
+                .expect("could not strip root path");
+            (old_path.as_str(), new_path.as_str())
+        })
+        .unzip();
 
-        contents = contents.replace(old_path.as_str(), new_path.as_str());
-    }
+    let matcher = AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(&old_names)
+        .expect("could not build the file name matcher");
+    let contents = matcher.replace_all(&contents, &new_names);
 
     fs::write(path, contents).expect("could not write file");
 }
@@ -323,17 +333,14 @@ fn replace_wasm_split_references(
     new_wasm_split_filename: &str,
     renamed_files: &HashMap<Utf8PathBuf, Utf8PathBuf>,
 ) -> Result<()> {
+    let mut wasm_files = Vec::new();
     for entry in fs::read_dir(pkg_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
             if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                 if filename.ends_with(".wasm") {
-                    replace_in_binary_file(
-                        &Utf8PathBuf::try_from(path).unwrap(),
-                        old_wasm_split_filename,
-                        new_wasm_split_filename,
-                    );
+                    wasm_files.push(Utf8PathBuf::try_from(path).unwrap());
                 } else if filename.starts_with("__wasm_split_manifest") {
                     rewrite_manifest(
                         &Utf8PathBuf::try_from(path).unwrap(),
@@ -344,6 +351,10 @@ fn replace_wasm_split_references(
             }
         }
     }
+
+    wasm_files.par_iter().for_each(|path| {
+        replace_in_binary_file(path, old_wasm_split_filename, new_wasm_split_filename);
+    });
 
     Ok(())
 }
@@ -389,6 +400,37 @@ mod tests {
             fs::metadata(&unrelated).unwrap().modified().unwrap(),
             unrelated_mtime,
             "a file without the name is not rewritten"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn text_patch_rewrites_all_names_in_one_pass_preferring_the_longest() {
+        let dir = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join("cargo_leptos_hash_rs_text_patch_test"),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("app.js");
+        fs::write(
+            &file,
+            "import('./chunk_1.wasm'); import('./chunk_10.wasm'); fetch('app.wasm.d.ts'); fetch('app.wasm')",
+        )
+        .unwrap();
+        let renamed = HashMap::from([
+            (dir.join("chunk_1.wasm"), dir.join("chunk_1.AAAA.wasm")),
+            (dir.join("chunk_10.wasm"), dir.join("chunk_10.BBBB.wasm")),
+            (dir.join("app.wasm"), dir.join("app.CCCC.wasm")),
+            (dir.join("app.wasm.d.ts"), dir.join("app.wasm.DDDD.d.ts")),
+        ]);
+
+        replace_in_file(&file, &renamed, &dir);
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "import('./chunk_1.AAAA.wasm'); import('./chunk_10.BBBB.wasm'); fetch('app.wasm.DDDD.d.ts'); fetch('app.CCCC.wasm')"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
