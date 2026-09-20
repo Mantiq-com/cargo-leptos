@@ -40,7 +40,10 @@ async fn build_frontend(proj: &Arc<Project>, changes: &ChangeSet) -> Result<bool
     }
 
     if proj.hash_files {
-        compile::add_hashes_to_site(proj)?;
+        // Hashing and patching the package output is blocking CPU and file
+        // work over every emitted file.
+        let proj = proj.clone();
+        tokio::task::spawn_blocking(move || compile::add_hashes_to_site(&proj)).await??;
     }
 
     // it is important to do the precompression of the static files before building the
@@ -83,22 +86,18 @@ pub async fn build_proj(proj: &Arc<Project>) -> Result<bool> {
         }
     }
 
-    let can_parallelize = !(proj.hash_files || proj.release && proj.precompress);
+    // Precompressed assets may be embedded into the server binary, so that
+    // build has to wait for them (see `build_frontend`). The hash file needs
+    // no such ordering: the server reads it at runtime.
+    let can_parallelize = !(proj.release && proj.precompress);
 
     if can_parallelize && needs_frontend && needs_server {
-        let front_hdl = compile::front(proj, &changes).await;
-        let assets_hdl = compile::assets(proj, &changes).await;
-        let style_hdl = compile::style(proj, &changes).await;
         let server_hdl = compile::server(proj, &changes).await;
+        let server = async { server_hdl.await.map_err(Error::from) };
 
-        let (front, assets, style, server) =
-            try_join!(front_hdl, assets_hdl, style_hdl, server_hdl)?;
+        let (frontend_ok, server) = try_join!(build_frontend(proj, &changes), server)?;
 
-        if !front?.is_success()
-            || !assets?.is_success()
-            || !style?.is_success()
-            || !server?.is_success()
-        {
+        if !frontend_ok || !server?.is_success() {
             return Ok(false);
         }
     } else {
