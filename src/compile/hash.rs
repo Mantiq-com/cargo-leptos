@@ -7,6 +7,7 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use camino::Utf8PathBuf;
 use eyre::{ContextCompat, Result};
 use md5::{Digest, Md5};
+use memchr::memmem;
 use std::{collections::HashMap, fs};
 
 ///Adds hashes to the filenames of the css, js, and wasm files in the output
@@ -301,10 +302,12 @@ fn replace_in_binary_file(path: &Utf8PathBuf, old_wasm_split: &str, new_wasm_spl
     let old_path = old_wasm_split.as_bytes();
     let new_path = new_wasm_split.as_bytes();
 
-    for i in 0..=contents.len() - old_path.len() {
-        if contents[i..].starts_with(old_path) {
-            contents[i..(i + old_path.len())].clone_from_slice(new_path);
-        }
+    let positions: Vec<usize> = memmem::find_iter(&contents, old_path).collect();
+    if positions.is_empty() {
+        return;
+    }
+    for i in positions {
+        contents[i..(i + old_path.len())].clone_from_slice(new_path);
     }
 
     fs::write(path, contents).expect("could not write file");
@@ -349,6 +352,46 @@ fn replace_wasm_split_references(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn binary_patch_replaces_every_occurrence_and_skips_untouched_files() {
+        let dir = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join("cargo_leptos_hash_rs_binary_patch_test"),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let old = "__wasm_split.______________________.js";
+        let new = "__wasm_split.NEWSPLITHASH1234567890.js";
+        assert_eq!(old.len(), new.len());
+
+        let patched = dir.join("chunk_1.wasm");
+        fs::write(&patched, format!("\0asm{old}--{old}")).unwrap();
+        // Shorter than the name being searched for: the naive byte loop this
+        // replaced computed `len - pattern_len` and panicked on such a chunk.
+        let tiny = dir.join("chunk_2.wasm");
+        fs::write(&tiny, b"\0asm").unwrap();
+        let unrelated = dir.join("chunk_3.wasm");
+        fs::write(&unrelated, b"\0asm no loader reference here").unwrap();
+        let unrelated_mtime = fs::metadata(&unrelated).unwrap().modified().unwrap();
+
+        replace_in_binary_file(&patched, old, new);
+        replace_in_binary_file(&tiny, old, new);
+        replace_in_binary_file(&unrelated, old, new);
+
+        assert_eq!(
+            fs::read(&patched).unwrap(),
+            format!("\0asm{new}--{new}").into_bytes()
+        );
+        assert_eq!(fs::read(&tiny).unwrap(), b"\0asm");
+        assert_eq!(
+            fs::metadata(&unrelated).unwrap().modified().unwrap(),
+            unrelated_mtime,
+            "a file without the name is not rewritten"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn does_not_repatch_the_wasm_split_loader_it_already_patched_1() {
