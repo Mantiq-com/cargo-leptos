@@ -424,7 +424,7 @@ async fn bindgen(proj: &Project) -> Result<Outcome<Product>> {
                     return Ok(Outcome::Success(()));
                 }
                 let wasm_opt = Exe::WasmOpt.get().await.dot()?;
-                let outcome = optimize(proj, wasm_file.dest.clone(), &wasm_opt).await?;
+                let outcome = optimize(proj, wasm_file.dest.clone(), &wasm_opt, None).await?;
                 debug!(
                     "Finished optimizing WASM in {:?}",
                     bindgen_emit_end_time.elapsed()
@@ -479,6 +479,11 @@ async fn bindgen(proj: &Project) -> Result<Outcome<Product>> {
 /// Either way the stream is dropped, which kills the wasm-opt processes still
 /// running; that includes one started after the interrupt, which would not
 /// have seen it.
+///
+/// Each run still starts a thread per core unless `BINARYEN_CORES` says
+/// otherwise, so one run per core would start cores² threads, enough on a
+/// large host to exhaust the per-user task limit and starve the machine. The
+/// runs therefore split the cores between them.
 async fn optimize_all(proj: &Project, files: Vec<Utf8PathBuf>) -> Result<Outcome<()>> {
     if files.is_empty() {
         return Ok(Outcome::Success(()));
@@ -486,11 +491,14 @@ async fn optimize_all(proj: &Project, files: Vec<Utf8PathBuf>) -> Result<Outcome
     let parallelism = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
+    let cores_per_run = (parallelism / files.len().min(parallelism))
+        .max(1)
+        .to_string();
 
     let wasm_opt = Exe::WasmOpt.get().await.dot()?;
 
     let mut runs = stream::iter(files)
-        .map(|file| optimize(proj, file, &wasm_opt))
+        .map(|file| optimize(proj, file, &wasm_opt, Some(&cores_per_run)))
         .buffer_unordered(parallelism);
     while let Some(run) = runs.next().await {
         if run? == Outcome::Stopped {
@@ -500,7 +508,13 @@ async fn optimize_all(proj: &Project, files: Vec<Utf8PathBuf>) -> Result<Outcome
     Ok(Outcome::Success(()))
 }
 
-async fn optimize(proj: &Project, file: Utf8PathBuf, wasm_opt: &Path) -> Result<Outcome<()>> {
+/// `cores` caps wasm-opt's thread pool; `None` lets it use every core.
+async fn optimize(
+    proj: &Project,
+    file: Utf8PathBuf,
+    wasm_opt: &Path,
+    cores: Option<&str>,
+) -> Result<Outcome<()>> {
     let mut args: Vec<&str> = if let Some(features) = &proj.wasm_opt_features {
         features.iter().map(|f| f.as_str()).collect()
     } else {
@@ -514,6 +528,9 @@ async fn optimize(proj: &Project, file: Utf8PathBuf, wasm_opt: &Path) -> Result<
 
     let mut cmd = Command::new(wasm_opt);
     cmd.args(args.clone());
+    if let Some(cores) = cores {
+        cmd.env("BINARYEN_CORES", cores);
+    }
 
     trace!("WASM running wasm-opt {}", args.join(" "));
 
