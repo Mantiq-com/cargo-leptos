@@ -3,10 +3,12 @@ use crate::{
     ext::{eyre::CustomWrapErr, PathBufExt},
     internal_prelude::*,
 };
+use aho_corasick::AhoCorasick;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use camino::{Utf8Path, Utf8PathBuf};
 use eyre::{ContextCompat, Result};
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 use regex::bytes::{Captures, Regex};
 use std::{
     cmp,
@@ -162,16 +164,6 @@ fn front_files(proj: &Project) -> Result<Vec<Utf8PathBuf>> {
                         }
                     }
 
-                    let hash = md5_hash(&fs::read(&path)?);
-
-                    if path
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == hash)
-                    {
-                        continue;
-                    }
-
                     files.push(Utf8PathBuf::from_path_buf(path).expect("invalid path"));
                 } else if path.is_dir() {
                     stack.push(path);
@@ -179,6 +171,16 @@ fn front_files(proj: &Project) -> Result<Vec<Utf8PathBuf>> {
             }
         }
     }
+
+    let already_hashed = files
+        .par_iter()
+        .map(|path| Ok(path.file_stem() == Some(md5_hash(&fs::read(path)?).as_str())))
+        .collect::<Result<Vec<_>>>()?;
+    let mut files = files
+        .into_iter()
+        .zip(already_hashed)
+        .filter_map(|(path, already_hashed)| (!already_hashed).then_some(path))
+        .collect::<Vec<_>>();
 
     files.sort();
     Ok(files)
@@ -207,10 +209,11 @@ fn hash_files(
         .collect::<Result<Vec<_>>>()?;
     let kinds = files.iter().map(|f| rewrite_kind(f)).collect::<Vec<_>>();
     let mut contents = files
-        .iter()
+        .par_iter()
         .map(|f| fs::read(f).wrap_err_with(|| format!("Failed to read {f}")))
         .collect::<Result<Vec<_>>>()?;
     let refs = (0..files.len())
+        .into_par_iter()
         .map(|i| references(kinds[i], &contents[i], &rels).wrap_err_with(|| files[i].to_string()))
         .collect::<Result<Vec<_>>>()?;
 
@@ -234,19 +237,28 @@ fn hash_files(
                 }
             }
             let group_hash = group_hash.finalize();
-            for &i in &group {
-                let hash = Base64UrlUnpadded::encode_string(
-                    &Md5::new()
-                        .chain_update(&contents[i])
-                        .chain_update(group_hash)
-                        .finalize(),
-                );
-                new_rels[i] = Some(hashed_name(&rels[i], &hash)?);
+            let named = group
+                .par_iter()
+                .map(|&i| {
+                    let hash = Base64UrlUnpadded::encode_string(
+                        &Md5::new()
+                            .chain_update(&contents[i])
+                            .chain_update(group_hash)
+                            .finalize(),
+                    );
+                    Ok((hashed_name(&rels[i], &hash)?, hash))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (&i, (new_rel, hash)) in group.iter().zip(named) {
+                new_rels[i] = Some(new_rel);
                 hashes[i] = Some(hash);
             }
-            for &i in &group {
-                contents[i] =
-                    rewrite(kinds[i], &contents[i], &renames(&refs[i], &rels, &new_rels))?;
+            let rewritten = group
+                .par_iter()
+                .map(|&i| rewrite(kinds[i], &contents[i], &renames(&refs[i], &rels, &new_rels)))
+                .collect::<Result<Vec<_>>>()?;
+            for (&i, new_contents) in group.iter().zip(rewritten) {
+                contents[i] = new_contents;
             }
         } else {
             let i = group[0];
@@ -257,24 +269,33 @@ fn hash_files(
         }
     }
 
-    let mut hashed = HashMap::new();
-    for (i, path) in files.iter().enumerate() {
+    let new_paths = new_rels
+        .into_iter()
+        .map(|rel| pkg_dir.join(rel.unwrap()))
+        .collect::<Vec<_>>();
+    (0..files.len()).into_par_iter().try_for_each(|i| {
+        let (path, new_path) = (&files[i], &new_paths[i]);
         if !refs[i].is_empty() {
             fs::write(path, &contents[i]).wrap_err_with(|| format!("Failed to write {path}"))?;
         }
-        let new_path = pkg_dir.join(new_rels[i].take().unwrap());
-        fs::rename(path, &new_path)
-            .wrap_err_with(|| format!("Failed to rename {path} to {new_path}"))?;
-        hashed.insert(
-            path.clone(),
-            HashedFile {
-                path: new_path,
-                hash: hashes[i].take().unwrap(),
-            },
-        );
-    }
+        fs::rename(path, new_path)
+            .wrap_err_with(|| format!("Failed to rename {path} to {new_path}"))
+    })?;
 
-    Ok(hashed)
+    Ok(files
+        .iter()
+        .cloned()
+        .zip(new_paths.into_iter().zip(hashes))
+        .map(|(path, (new_path, hash))| {
+            (
+                path,
+                HashedFile {
+                    path: new_path,
+                    hash: hash.unwrap(),
+                },
+            )
+        })
+        .collect())
 }
 
 fn md5_hash(contents: &[u8]) -> String {
@@ -323,7 +344,15 @@ fn references(kind: Rewrite, contents: &[u8], rels: &[String]) -> Result<Vec<usi
     };
     Ok(match kind {
         Rewrite::None => Vec::new(),
-        Rewrite::Text => (0..rels.len()).filter(|&i| contains(&rels[i])).collect(),
+        Rewrite::Text => {
+            let mut found = AhoCorasick::new(rels)?
+                .find_overlapping_iter(contents)
+                .map(|m| m.pattern().as_usize())
+                .collect::<Vec<_>>();
+            found.sort_unstable();
+            found.dedup();
+            found
+        }
         Rewrite::Binary => (0..rels.len())
             .filter(|&i| rels[i].contains(HASH_PLACEHOLDER) && contains(&rels[i]))
             .collect(),
@@ -664,6 +693,20 @@ mod tests {
             ]
         );
         assert_eq!(rewritten["load_b"], ["chunk_10.BBBBBBBBBBBBBBBBBBBBBB"]);
+    }
+
+    #[test]
+    fn text_references_include_names_that_overlap() {
+        let rels = ["app.wasm", "app.wasm.d.ts", "chunk_1.wasm", "chunk_10.wasm"].map(String::from);
+        assert_eq!(
+            references(
+                Rewrite::Text,
+                b"fetch('app.wasm.d.ts'); import('./chunk_10.wasm')",
+                &rels
+            )
+            .unwrap(),
+            [0, 1, 3]
+        );
     }
 
     #[test]
