@@ -630,6 +630,7 @@ dependencies = [
 name = "cargo-leptos"
 version = "0.3.11"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64ct",
@@ -660,6 +661,7 @@ dependencies = [
  "md-5",
  "notify-debouncer-full",
  "pathdiff",
+ "rayon",
  "regex",
  "reqwest",
  "seahash",
