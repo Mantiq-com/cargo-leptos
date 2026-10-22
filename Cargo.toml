@@ -18,7 +18,9 @@ serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 color-eyre = "0.6.5"
 libflate = "2.3"
-tracing = "0.1.44"
+# The logger reads `log` records: keep emitting them after a dependency sets a
+# `tracing` dispatcher, which otherwise turns the fallback off for the process.
+tracing = { version = "0.1.44", features = ["log-always"] }
 cargo-config2 = "0.1.45"
 target-lexicon = "0.13.5"
 lightningcss = { version = "1.0.0-alpha.72", features = [
