@@ -7265,8 +7265,7 @@ dependencies = [
 [[package]]
 name = "wasm_split_cli_support"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6c1f994b196e31969f4cdbe37d051362659567efc0f5c90cb931a8a5cdc530f"
+source = "git+https://github.com/WorldSender/wasm-split-prototype#ba83ec745425b7295165fc0c64c9754f249c9183"
 dependencies = [
  "eyre",
  "gimli 0.34.0",
