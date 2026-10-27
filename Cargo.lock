@@ -7265,7 +7265,7 @@ dependencies = [
 [[package]]
 name = "wasm_split_cli_support"
 version = "0.2.4"
-source = "git+https://github.com/WorldSender/wasm-split-prototype#ba83ec745425b7295165fc0c64c9754f249c9183"
+source = "git+https://github.com/adrianncovaci/wasm-split-prototype?branch=exp/min-chunk-size#f70b5fb55fb4513969e27a4abee640dedeff0a3d"
 dependencies = [
  "eyre",
  "gimli 0.34.0",
