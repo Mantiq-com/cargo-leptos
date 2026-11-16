@@ -2241,7 +2241,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7518b930f6aeb75e871d32ce873c2ae46e35cef19b5a0b039d4337f651d897cd"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -7345,8 +7345,7 @@ dependencies = [
 [[package]]
 name = "wasm_split_cli_support"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d301082e27eb836f18aae1d1c643f5aded266d2ba746ab51e4b396cadade9ff"
+source = "git+https://github.com/WorldSEnder/wasm-split-prototype#1ca707ba2d50508a2bfa3b72071a8c56693d8d31"
 dependencies = [
  "eyre",
  "fixedbitset",
